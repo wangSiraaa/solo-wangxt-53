@@ -1,0 +1,5 @@
+barcode,name,category,damage,highValue
+6903001,儿童棉袜,clothing,0,false
+6903002,绘本套装,book,1,false
+6901001,重复的羽绒服（库内已有）,clothing,0,true
+6903003,破损玩具,toy,3,false
