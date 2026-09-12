@@ -1,14 +1,15 @@
 /**
- * 公益仓库离线扫码装箱 —— 领域类型
+ * 公益仓库离线扫码装箱 —— 领域类型（v2：支持多工程合并）
  *
- * 设计要点：
- * - Item 代表唯一的一件实物（条码唯一）。重复扫描只定位原物品，绝不产生第二份库存。
- * - Box(箱) 按「机构 + 适用品类 + 污损等级上限」组织；物品装箱必须同时满足三类约束。
- * - 高价值物品必须先有复核结论才能装箱。
- * - 所有变更都以 OperationLog 追加记录（append-only），撤销也是追加一条 REVERT，而非物理删除。
+ * 身份模型（关键）：
+ * - 每件物品有全局稳定身份 itemId = `${来源工程ID}#${创建操作uid}`；
+ *   条码只是可变属性（允许人工改写 RELABEL），不能再当作身份。
+ * - 每条操作日志有 (originProjectId, uid, seq)：
+ *   uid 为工程内稳定编号，seq 为工程内单调序号（因果顺序），
+ *   at 只是该工程本机时钟，仅用于展示，合并判定绝不使用它。
+ * - 箱/机构同样用全局引用 globalRef = `${工程ID}#${本地ID}`。
  */
 
-/** 污损等级：数字越小成色越好 */
 export type DamageGrade = 0 | 1 | 2 | 3;
 
 export const DAMAGE_LABEL: Record<DamageGrade, string> = {
@@ -18,12 +19,7 @@ export const DAMAGE_LABEL: Record<DamageGrade, string> = {
   3: '污损（需处理）'
 };
 
-export type ItemCategory =
-  | 'clothing' // 衣物
-  | 'book' // 书籍文具
-  | 'toy' // 玩具
-  | 'food' // 食品
-  | 'medical'; // 医疗用品
+export type ItemCategory = 'clothing' | 'book' | 'toy' | 'food' | 'medical';
 
 export const CATEGORY_LABEL: Record<ItemCategory, string> = {
   clothing: '衣物',
@@ -33,101 +29,214 @@ export const CATEGORY_LABEL: Record<ItemCategory, string> = {
   medical: '医疗用品'
 };
 
-/** 接收/发放机构（箱只能属于一个机构；物资只能进入被授权品类的机构箱） */
 export interface Organization {
+  /** 全局引用 projectId#localId */
   id: string;
+  originProjectId: string;
   name: string;
-  /** 该机构授权接收的品类 */
   allowedCategories: ItemCategory[];
-  /** 该机构可接收的最高污损等级（含）。例如只收全新则为 0 */
   maxDamage: DamageGrade;
   note?: string;
 }
 
-/** 复核结论（高价值物品必填） */
 export type ReviewVerdict = 'approved' | 'rejected';
 
 export interface Review {
+  /** 稳定编号，跨工程合并去重靠它 */
+  uid: string;
+  projectId: string;
+  seq: number;
   at: number;
   by: string;
   verdict: ReviewVerdict;
   note?: string;
 }
 
-/** 物品所处位置 */
 export type ItemLocation =
-  | { kind: 'queue' } // 待装箱队列
-  | { kind: 'box'; boxId: string } // 某只箱内
-  | { kind: 'handed'; boxId: string }; // 已随整箱交接（锁定）
+  | { kind: 'queue' }
+  | { kind: 'box'; boxId: string }
+  | { kind: 'handed'; boxId: string };
 
 export interface Item {
-  barcode: string; // 主键，唯一
+  /** 全局稳定身份 */
+  itemId: string;
+  originProjectId: string;
+  /** 当前条码（可能被人工改写） */
+  barcode: string;
+  /** 历史条码（曾用码），RELABEL 时留存 */
+  aliases: string[];
   name: string;
   category: ItemCategory;
   damage: DamageGrade;
   highValue: boolean;
-  /** 最近一次扫码时间 */
   scannedAt: number;
-  /** 扫码累计次数（重复扫描累加，用于“定位原物品”） */
   scanCount: number;
-  /** 高价值复核记录，可追加多条；以最后一条结论为准 */
   reviews: Review[];
   location: ItemLocation;
   createdAt: number;
+  /** 被合并身份的其他 itemId（同一实物裁决后） */
+  mergedFrom?: string[];
+  /** 不同工程都声称“已交接”时保留双方证据，冻结转移 */
+  handoverClaims?: HandoverClaim[];
+  /** 双向交接等未决：冻结一切转移 */
+  frozen?: boolean;
+  frozenReason?: string;
+  /** 还有待裁决项（成色/去向/同码）：未裁决前阻止装箱转移 */
+  awaitingArbitration?: boolean;
+  arbitrationKinds?: string[];
 }
 
 export type BoxStatus = 'open' | 'handed';
 
+export interface HandoverEvidence {
+  itemId: string;
+  barcode: string;
+  name: string;
+  category: ItemCategory;
+  damage: DamageGrade;
+}
+
+/** 一件物品被两个工程分别记录交接时，双方证据都保留；active=false 表示该次交接已退回 */
+export interface HandoverClaim {
+  projectId: string;
+  boxId: string;
+  receiver?: string;
+  at: number;
+  damage: DamageGrade;
+  barcode: string;
+  active?: boolean;
+}
+
 export interface Box {
+  /** 全局引用 projectId#localId */
   id: string;
-  label: string; // 箱号/标签，如 A-01
+  originProjectId: string;
+  /** 工程内箱号，如 A-01 */
+  label: string;
   orgId: string;
-  /** 装箱允许的品类（通常取机构授权品类的子集） */
   categories: ItemCategory[];
-  /** 装箱允许的最高污损等级（含） */
   maxDamage: DamageGrade;
   status: BoxStatus;
   createdAt: number;
   handedAt?: number;
-  /** 交接前“逐件检查”勾选：barcode -> 检查员/时间 */
-  checks: Record<string, { at: number; by: string }>;
-  /** 交接接收人 */
   receiver?: string;
-  /** 退回说明（已交接箱若发生退回） */
+  /** 逐件检查：键为 itemId（条码改写也不受影响） */
+  checks: Record<string, { at: number; by: string }>;
   returnedAt?: number;
   returnReason?: string;
 }
 
 export type OperationType =
-  | 'SCAN' // 扫码新增（连续扫码可撤销的那类）
-  | 'RESCAN' // 重复扫码（仅定位，无库存变化）
+  | 'SCAN' // 扫码新增
+  | 'RESCAN' // 重复扫码（仅定位）
   | 'IMPORT' // 文件导入新增
+  | 'RELABEL' // 人工改写条码
+  | 'GRADE' // 成色复核改级（from/to 形成因果链）
+  | 'BOX_CREATE' // 建箱
   | 'REVIEW' // 高价值复核追加
-  | 'PACK' // 装箱
-  | 'UNPACK' // 从打开的箱取出 / 退回处理
-  | 'MOVE' // 移箱（同时改来源箱与目标箱）
-  | 'CHECK' // 整箱交接前逐件检查
-  | 'HANDOVER' // 整箱交接（锁定）
-  | 'RETURN' // 已交接清单的错误通过退回处理
-  | 'REVERT'; // 撤销：补偿记录，不物理删除历史
+  | 'PACK'
+  | 'UNPACK'
+  | 'MOVE'
+  | 'CHECK'
+  | 'HANDOVER' // 整箱交接（带交接时刻证据快照）
+  | 'RETURN' // 交接退回
+  | 'REVERT' // 撤销扫码（补偿记录）
+  | 'MERGE_IMPORT' // 合并导入审计（不参与状态重放）
+  | 'MERGE_RESOLVE'; // 冲突裁决审计（不参与状态重放）
 
 export interface OperationLog {
-  id: number; // 自增
+  /** 工程内稳定编号（主键） */
+  uid: string;
+  /** 操作来源工程 */
+  projectId: string;
+  /** 工程内单调序号：同一工程内的因果顺序 */
+  seq: number;
+  /** 该工程本机时钟，仅展示用，合并判定不依赖 */
   at: number;
   type: OperationType;
   operator: string;
+  itemId?: string;
+  /** 条码快照（展示用；身份看 itemId） */
   barcode?: string;
+  oldBarcode?: string; // RELABEL
+  from?: DamageGrade; // GRADE
+  to?: DamageGrade; // GRADE
   boxId?: string;
   fromBoxId?: string;
   toBoxId?: string;
-  /** 被撤销的原始日志 id（仅 REVERT） */
-  revertsId?: number;
+  receiver?: string; // HANDOVER
+  evidence?: HandoverEvidence[]; // HANDOVER
+  revertsUid?: string;
   detail?: string;
+  /** BOX_CREATE/CHECK/REVIEW/HANDOVER 等操作的结构化载荷 */
+  payload?: Record<string, unknown>;
 }
 
-export interface DatabaseShape {
-  organizations: Organization;
-  items: Item;
-  boxes: Box;
-  logs: OperationLog;
+/** 工程元信息（meta store 单例） */
+export interface ProjectMeta {
+  key: 'meta';
+  projectId: string;
+  projectName: string;
+  createdAt: number;
+  /** 本工程已分配的最大操作序号 */
+  seq: number;
+}
+
+/**
+ * 合并台账：
+ * - ingested：已导入的操作键 projectId#uid（幂等：同一包反复导入不重复）
+ * - adjudications：冲突裁决（稳定 conflictKey -> 决定），随工程快照一起导出
+ */
+export interface MergeLedger {
+  key: 'ledger';
+  ingested: Record<string, { packageId?: string }>;
+  adjudications: Record<string, Adjudication>;
+  packages: Record<string, { name?: string }>;
+}
+
+export type Adjudication =
+  | {
+      kind: 'ITEM_COLLISION';
+      /** 同一实物：loser 身份并入 winner，双方证据都保留 */
+      decision: 'same_item';
+      winner: string;
+      loser: string;
+      by: string;
+      note?: string;
+      /** 裁决时的证据指纹；证据变化则冲突重新出现 */
+      signature: string;
+    }
+  | {
+      kind: 'ITEM_COLLISION';
+      /** 不同实物：给其中一件改派新条码 */
+      decision: 'separate';
+      relabelItemId: string;
+      newBarcode: string;
+      by: string;
+      note?: string;
+      signature: string;
+    }
+  | { kind: 'DAMAGE'; decision: DamageGrade; by: string; note?: string; signature: string }
+  | { kind: 'LOCATION'; decision: ItemLocation; by: string; note?: string; signature: string }
+  | { kind: 'DUAL_HANDOVER'; decision: string /* chosenBoxId */; by: string; note: string; signature: string };
+
+export function opKey(projectId: string, uid: string): string {
+  return `${projectId}#${uid}`;
+}
+
+export function refOf(projectId: string, localId: string): string {
+  return `${projectId}#${localId}`;
+}
+
+export interface SnapshotV2 {
+  format: 'charity-warehouse/v2';
+  exportedAt: number;
+  payload: {
+    meta: ProjectMeta;
+    ledger: MergeLedger;
+    organizations: Organization[];
+    items: Item[];
+    boxes: Box[];
+    logs: OperationLog[];
+  };
 }

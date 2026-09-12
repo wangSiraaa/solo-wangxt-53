@@ -121,7 +121,7 @@ export function download(filename: string, content: string, mime: string): void 
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/** 重新打开工程：完整快照 JSON，可在“导入工程快照”中恢复 */
+/** 重新打开工程：完整 v2 快照 JSON，可在“合并工程”中导入或恢复 */
 export function buildSnapshot(payload: unknown): string {
-  return JSON.stringify({ format: 'charity-warehouse/v1', exportedAt: Date.now(), payload }, null, 2);
+  return JSON.stringify({ format: 'charity-warehouse/v2', exportedAt: Date.now(), payload }, null, 2);
 }

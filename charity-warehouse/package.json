@@ -11,7 +11,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo": "vite-node scripts/e2e-demo.ts"
+    "demo": "vite-node scripts/e2e-demo.ts",
+    "demo:merge": "vite-node scripts/merge-demo.ts"
   },
   "dependencies": {
     "@zxing/browser": "^0.1.5",

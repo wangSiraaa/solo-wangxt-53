@@ -33,7 +33,6 @@
   $: otherBoxes = boxes.filter((b) => b.id !== selectedBox?.id);
   $: isLocked = selectedBox?.status === 'handed';
 
-  // 候选装箱物品逐条给出适配结论 —— 一箱混入不适配物品在点击前就能看到全部原因
   function packPreview(item: Item, box: Box | undefined) {
     if (!box) return [];
     return validatePack(item, box, $state.orgs.find((o) => o.id === box.orgId));
@@ -42,7 +41,7 @@
   async function pack(item: Item) {
     if (!selectedBox) return;
     try {
-      await packItem(item.barcode, selectedBox.id, $operator);
+      await packItem(item.itemId, selectedBox.id, $operator);
       await reload();
       notify('ok', `「${item.name}」已装入 ${selectedBox.label}`);
     } catch (e) {
@@ -52,7 +51,7 @@
 
   async function unpack(item: Item) {
     try {
-      await unpackItem(item.barcode, $operator);
+      await unpackItem(item.itemId, $operator);
       await reload();
       notify('ok', `「${item.name}」已取出回队列`);
     } catch (e) {
@@ -66,7 +65,7 @@
       return;
     }
     try {
-      await moveItem(item.barcode, selectedBox.id, targetBoxForMove, $operator);
+      await moveItem(item.itemId, selectedBox.id, targetBoxForMove, $operator);
       await reload();
       notify('ok', '移箱完成（来源箱与目标箱已在同一事务内更新）');
     } catch (e) {
@@ -77,7 +76,7 @@
   async function check(item: Item) {
     if (!selectedBox) return;
     try {
-      await toggleCheck(item.barcode, selectedBox.id, $operator);
+      await toggleCheck(item.itemId, selectedBox.id, $operator);
       await reload();
     } catch (e) {
       notify('err', (e as Error).message);
@@ -86,14 +85,9 @@
 
   async function reload() {
     await refresh();
-    if (selectedBox?.status === 'open') {
-      readiness = await getHandoverReadiness(selectedBox.id);
-    } else {
-      readiness = null;
-    }
+    readiness = selectedBox && selectedBox.status === 'open' ? await getHandoverReadiness(selectedBox.id) : null;
   }
 
-  // 选中箱变化时重算交接就绪度
   $: if (selectedBox && selectedBox.status === 'open') {
     void getHandoverReadiness(selectedBox.id).then((r) => (readiness = r));
   } else {
@@ -146,7 +140,7 @@
     {#each boxes as b}
       <button class="boxtab" class:active={selectedBox?.id === b.id} on:click={() => (selectedBoxId = b.id)}>
         {b.label}
-        {#if b.status === 'handed'}<span class="lock">🔒已交接</span>{/if}
+        {#if b.status === 'handed'}<span class="lock">🔒</span>{/if}
       </button>
     {/each}
   </div>
@@ -183,12 +177,15 @@
     <h3>箱内物品（{itemsInBox.length} 件）</h3>
     <table>
       <thead>
-        <tr><th>条码</th><th>名称</th><th>品类</th><th>成色</th><th>高价值复核</th>{#if !isLocked}<th>逐件检查</th>{/if}<th>位置操作</th></tr>
+        <tr><th>条码/曾用码</th><th>名称</th><th>品类</th><th>成色</th><th>高价值复核</th>{#if !isLocked}<th>逐件检查</th>{/if}<th>来源/位置操作</th></tr>
       </thead>
       <tbody>
-        {#each itemsInBox as item (item.barcode)}
-          <tr>
-            <td class="mono">{item.barcode}</td>
+        {#each itemsInBox as item (item.itemId)}
+          <tr class:frozen={item.frozen}>
+            <td>
+              <div class="mono">{item.barcode}</div>
+              {#if item.aliases.length}<div class="muted small">曾用：{item.aliases.join('、')}</div>{/if}
+            </td>
             <td>{item.name}</td>
             <td>{CATEGORY_LABEL[item.category]}</td>
             <td><DamageBadge grade={item.damage} /></td>
@@ -199,13 +196,16 @@
                   {last ? (last.verdict === 'approved' ? '✔ 复核通过' : '✘ 复核不通过') : '缺复核'}
                 </span>
               {:else}—{/if}
+              {#if item.handoverClaims?.length && item.handoverClaims.length > 1}
+                <div class="bad-text small">⛔ 双方交接证据 {item.handoverClaims.length} 份</div>
+              {/if}
             </td>
             {#if !isLocked}
               <td>
                 {#if readiness}
-                  {@const row = readiness.perItem.find((p) => p.item.barcode === item.barcode)}
-                  <button class="mini {selectedBox.checks[item.barcode] ? 'ok' : 'warn'}" on:click={() => check(item)}>
-                    {selectedBox.checks[item.barcode] ? `✔ 已核（${selectedBox.checks[item.barcode].by}）` : '☐ 未检查'}
+                  {@const row = readiness.perItem.find((p) => p.item.itemId === item.itemId)}
+                  <button class="mini {selectedBox.checks[item.itemId] ? 'ok' : 'warn'}" on:click={() => check(item)}>
+                    {selectedBox.checks[item.itemId] ? `✔ 已核（${selectedBox.checks[item.itemId].by}）` : '☐ 未检查'}
                   </button>
                   {#if row && row.violations.filter((v) => v.code !== 'CHECK_MISSING').length > 0}
                     <div class="bad-text small">
@@ -216,8 +216,11 @@
               </td>
             {/if}
             <td>
+              <div class="src small">{item.originProjectId}</div>
               {#if isLocked}
-                <span class="muted">锁定中</span>
+                <span class="muted small">锁定中</span>
+              {:else if item.frozen}
+                <span class="bad-text small">冻结：{item.frozenReason}</span>
               {:else}
                 <button class="mini" on:click={() => unpack(item)} title="取出回队列">取出</button>
                 <select bind:value={targetBoxForMove}>
@@ -277,12 +280,15 @@
 
       <h3>待装箱队列（{queueItems.length} 件）—— 选择装入本箱</h3>
       <table>
-        <thead><tr><th>条码</th><th>名称</th><th>品类</th><th>成色</th><th>高价值</th><th>适配预检</th><th></th></tr></thead>
+        <thead><tr><th>条码/曾用码</th><th>名称</th><th>品类</th><th>成色</th><th>高价值</th><th>适配预检</th><th></th></tr></thead>
         <tbody>
-          {#each queueItems as item (item.barcode)}
+          {#each queueItems as item (item.itemId)}
             {@const reasons = packPreview(item, selectedBox)}
             <tr class:badrow={reasons.length > 0}>
-              <td class="mono">{item.barcode}</td>
+              <td>
+                <div class="mono">{item.barcode}</div>
+                {#if item.aliases.length}<div class="muted small">曾用：{item.aliases.join('、')}</div>{/if}
+              </td>
               <td>{item.name}</td>
               <td>{CATEGORY_LABEL[item.category]}</td>
               <td><DamageBadge grade={item.damage} /></td>
@@ -319,12 +325,13 @@
   .return-row { display: flex; gap: 8px; }
   .return-row input { flex: 1; padding: 7px; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { border: 1px solid #d5d8dc; padding: 6px 9px; text-align: left; }
+  th, td { border: 1px solid #d5d8dc; padding: 6px 9px; text-align: left; vertical-align: top; }
   th { background: #f8f9f9; }
   .mono { font-family: ui-monospace, monospace; }
   .muted { color: #888; }
   .small { font-size: 12px; }
   .empty { text-align: center; color: #888; }
+  .src { font-family: ui-monospace, monospace; color: #555; }
   .mini { font-size: 12px; padding: 3px 9px; cursor: pointer; margin-right: 4px; }
   .mini.ok { background: #d5f5e3; }
   .mini.warn { background: #fdebd0; }
@@ -332,6 +339,7 @@
   .ok-text { color: #1e8449; }
   .bad-text { color: #c0392b; }
   tr.badrow { background: #fdf3f2; }
+  tr.frozen { background: #fdedec; }
   .readiness { border: 1px solid #d5d8dc; border-radius: 6px; padding: 10px 12px; background: #fbfcfc; }
   .peritem { margin: 6px 0 10px; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
   .handover-row { display: flex; align-items: center; gap: 8px; }

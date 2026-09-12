@@ -10,8 +10,7 @@ import type {
   Review
 } from './types';
 
-export interface RuleViolation {
-  code:
+export type RuleViolationCode =
     | 'BOX_LOCKED'
     | 'ORG_CATEGORY'
     | 'ORG_DAMAGE'
@@ -20,8 +19,13 @@ export interface RuleViolation {
     | 'REVIEW_MISSING'
     | 'REVIEW_REJECTED'
     | 'ITEM_LOCKED'
+    | 'ITEM_FROZEN'
+    | 'ITEM_PENDING_ARBITRATION'
     | 'ITEM_ALREADY_IN_BOX'
     | 'CHECK_MISSING';
+
+export interface RuleViolation {
+  code: RuleViolationCode;
   message: string;
 }
 
@@ -52,6 +56,16 @@ export function validatePack(
 
   if (item.location.kind === 'handed') {
     reasons.push({ code: 'ITEM_LOCKED', message: `物品 ${item.barcode} 已随箱交接锁定，需先走退回流程` });
+  }
+
+  if (item.frozen) {
+    reasons.push({ code: 'ITEM_FROZEN', message: `物品已冻结：${item.frozenReason ?? '存在待人工核实的合并冲突'}` });
+  }
+  if (item.awaitingArbitration) {
+    reasons.push({
+      code: 'ITEM_PENDING_ARBITRATION',
+      message: `存在未裁决合并冲突（${(item.arbitrationKinds ?? []).join('、')}），裁决前不能装箱`
+    });
   }
 
   if (
@@ -140,7 +154,7 @@ export function evaluateHandover(
       // 已在本箱内不算违规
       (v) => v.code !== 'ITEM_ALREADY_IN_BOX'
     );
-    const checked = Boolean(box.checks[item.barcode]);
+    const checked = Boolean(box.checks[item.itemId]);
     if (!checked) {
       violations.push({ code: 'CHECK_MISSING', message: '尚未逐件检查勾选' });
     }
@@ -151,10 +165,10 @@ export function evaluateHandover(
 }
 
 /**
- * 撤销一条“扫码新增”日志是否安全：
- * - 只能撤销 SCAN / IMPORT 产生的新增；
+ * 撤销一条“扫码新增”操作是否安全：
+ * - 只能撤销本工程 SCAN / IMPORT 产生的新增；
  * - 物品必须仍在待装箱队列（没有装箱/移箱/交接）；
- * - 该条码之后不得追加过复核记录 —— 撤销绝不误删后来的复核。
+ * - 其后不得追加过复核记录 —— 撤销绝不误删后来的复核。
  */
 export function canRevertScan(
   creation: OperationLog,
@@ -170,17 +184,11 @@ export function canRevertScan(
   if (item.location.kind !== 'queue') {
     return { ok: false, reason: '物品已装箱或已交接，不能撤销扫码（请先移回队列/走退回流程）' };
   }
-  const barcode = creation.barcode!;
-  const protectedLater = laterLogs.filter(
-    (l) =>
-      l.barcode === barcode &&
-      l.id > creation.id &&
-      (l.type === 'REVIEW' || l.type === 'PACK' || l.type === 'MOVE' || l.type === 'CHECK')
-  );
-  if (protectedLater.some((l) => l.type === 'REVIEW')) {
+  const itemId = item.itemId;
+  if (laterLogs.some((l) => l.itemId === itemId && l.seq > creation.seq && l.type === 'REVIEW')) {
     return { ok: false, reason: '该物品扫码后已追加高价值复核记录，撤销会破坏复核痕迹，已阻止' };
   }
-  if (protectedLater.length > 0) {
+  if (laterLogs.some((l) => l.itemId === itemId && l.seq > creation.seq && ['PACK', 'MOVE', 'CHECK'].includes(l.type))) {
     return { ok: false, reason: '该物品扫码后已发生装箱/移箱操作，不能直接撤销' };
   }
   return { ok: true };

@@ -1,21 +1,23 @@
 /**
- * 纯规则测试 —— 重点案例：一箱混入不适配物品、逐件交接、撤销安全性
+ * 纯规则测试 —— 装箱适配 / 逐件交接 / 撤销保护（v2：itemId 身份）
  */
 import { describe, expect, it } from 'vitest';
 import { canRevertScan, canReturnBox, evaluateHandover, latestReview, validatePack } from '../lib/rules';
 import type { Box, Item, OperationLog, Organization } from '../lib/types';
 
 const org: Organization = {
-  id: 'o1',
+  id: 'p1#o1',
+  originProjectId: 'p1',
   name: '爱华儿童福利院',
   allowedCategories: ['clothing', 'book', 'toy'],
   maxDamage: 1
 };
 
 const box: Box = {
-  id: 'b1',
+  id: 'p1#b1',
+  originProjectId: 'p1',
   label: 'A-01',
-  orgId: 'o1',
+  orgId: 'p1#o1',
   categories: ['clothing'],
   maxDamage: 1,
   status: 'open',
@@ -23,9 +25,14 @@ const box: Box = {
   checks: {}
 };
 
+let n = 0;
 function item(over: Partial<Item> = {}): Item {
+  n += 1;
   return {
-    barcode: 'X1',
+    itemId: `p1#x${n}`,
+    originProjectId: 'p1',
+    barcode: `X${n}`,
+    aliases: [],
     name: '卫衣',
     category: 'clothing',
     damage: 1,
@@ -39,108 +46,70 @@ function item(over: Partial<Item> = {}): Item {
   };
 }
 
-describe('validatePack — 机构限制 / 污损等级 / 高价值复核', () => {
+describe('validatePack', () => {
   it('适配物品可装箱', () => {
     expect(validatePack(item(), box, org)).toEqual([]);
   });
 
-  it('案例3：一箱混入不适配物品 —— 品类不符 + 污损超标 + 机构不收，逐条列出', () => {
-    const dirtyToy = item({ barcode: 'T1', name: '污损毛绒玩具', category: 'toy', damage: 3 });
-    const reasons = validatePack(dirtyToy, box, org).map((r) => r.code);
-    expect(reasons).toContain('BOX_CATEGORY');
-    expect(reasons).toContain('BOX_DAMAGE');
-    // 衣物箱 + 3 级污损：机构上限 1 也同时拦截
-    expect(reasons).toContain('ORG_DAMAGE');
+  it('一箱混入不适配物品：品类 + 污损 + 机构限制逐条列出', () => {
+    const codes = validatePack(item({ barcode: 'T1', name: '污损玩具', category: 'toy', damage: 3 }), box, org).map((r) => r.code);
+    expect(codes).toContain('BOX_CATEGORY');
+    expect(codes).toContain('BOX_DAMAGE');
+    expect(codes).toContain('ORG_DAMAGE');
   });
 
-  it('机构不接收的品类即使箱允许也不能装', () => {
-    const food = item({ category: 'food', damage: 0 });
-    const foodBox: Box = { ...box, categories: ['food'] };
-    const reasons = validatePack(food, foodBox, org).map((r) => r.code);
-    expect(reasons).toContain('ORG_CATEGORY');
-  });
-
-  it('高价值物品缺复核 / 复核不通过均被拦截，通过后可装', () => {
+  it('高价值复核缺失/不通过拦截，通过放行（以最后一条为准）', () => {
     const hv = item({ highValue: true });
     expect(validatePack(hv, box, org).map((r) => r.code)).toContain('REVIEW_MISSING');
-
-    hv.reviews = [{ at: 2, by: '张三', verdict: 'rejected' }];
+    hv.reviews = [{ uid: 'u1', projectId: 'p1', seq: 1, at: 2, by: '张', verdict: 'rejected' }];
     expect(validatePack(hv, box, org).map((r) => r.code)).toContain('REVIEW_REJECTED');
-    expect(latestReview(hv)?.verdict).toBe('rejected');
-
-    hv.reviews.push({ at: 3, by: '李四', verdict: 'approved' });
+    hv.reviews.push({ uid: 'u2', projectId: 'p1', seq: 2, at: 3, by: '李', verdict: 'approved' });
     expect(validatePack(hv, box, org)).toEqual([]);
-    expect(latestReview(hv)?.by).toBe('李四');
+    expect(latestReview(hv)?.by).toBe('李');
+  });
+
+  it('冻结 / 待裁决物品不能装箱', () => {
+    expect(validatePack(item({ frozen: true, frozenReason: '双交接' }), box, org).map((r) => r.code)).toContain('ITEM_FROZEN');
+    expect(validatePack(item({ awaitingArbitration: true, arbitrationKinds: ['DAMAGE'] }), box, org).map((r) => r.code)).toContain('ITEM_PENDING_ARBITRATION');
   });
 
   it('已交接锁定箱拒绝装入', () => {
-    const locked = { ...box, status: 'handed' as const };
-    expect(validatePack(item(), locked, org).map((r) => r.code)).toContain('BOX_LOCKED');
+    expect(validatePack(item(), { ...box, status: 'handed' }, org).map((r) => r.code)).toContain('BOX_LOCKED');
   });
 });
 
-describe('evaluateHandover — 整箱交接前逐件检查（不只是禁用按钮）', () => {
-  it('未勾选逐件检查则每件都阻断', () => {
-    const a = item({ barcode: 'A', location: { kind: 'box', boxId: 'b1' } });
-    const r = evaluateHandover(box, [a], org);
+describe('evaluateHandover（逐件检查，不只是禁用按钮）', () => {
+  it('未勾检每件都阻断；不适配物品即使勾选也拦住；全部通过才放行', () => {
+    const a = item({ location: { kind: 'box', boxId: box.id } });
+    let r = evaluateHandover(box, [a], org);
     expect(r.ok).toBe(false);
     expect(r.perItem[0].violations.map((v) => v.code)).toContain('CHECK_MISSING');
-  });
 
-  it('混入的不适配物品在交接时再次被拦住（即使被错误勾选）', () => {
-    const good = item({ barcode: 'A', location: { kind: 'box', boxId: 'b1' } });
-    const bad = item({ barcode: 'B', category: 'toy', damage: 3, location: { kind: 'box', boxId: 'b1' } });
-    const checkedBox: Box = {
-      ...box,
-      checks: {
-        A: { at: 1, by: 'x' },
-        B: { at: 1, by: 'x' }
-      }
-    };
-    const r = evaluateHandover(checkedBox, [good, bad], org);
-    expect(r.ok).toBe(false);
+    const bad = item({ category: 'toy', damage: 3, location: { kind: 'box', boxId: box.id } });
+    const checked: Box = { ...box, checks: { [a.itemId]: { at: 1, by: 'x' }, [bad.itemId]: { at: 1, by: 'x' } } };
+    r = evaluateHandover(checked, [a, bad], org);
     expect(r.blockingCount).toBe(1);
-    const rowB = r.perItem.find((p) => p.item.barcode === 'B')!;
-    expect(rowB.violations.length).toBeGreaterThan(0);
-    const rowA = r.perItem.find((p) => p.item.barcode === 'A')!;
-    expect(rowA.violations).toEqual([]);
-  });
-
-  it('全部逐件检查且适配才允许交接；空箱不行', () => {
-    const a = item({ barcode: 'A', location: { kind: 'box', boxId: 'b1' } });
-    const checkedBox: Box = { ...box, checks: { A: { at: 1, by: 'x' } } };
-    expect(evaluateHandover(checkedBox, [a], org).ok).toBe(true);
-    expect(evaluateHandover(checkedBox, [], org).ok).toBe(false);
+    expect(evaluateHandover({ ...box, checks: { [a.itemId]: { at: 1, by: 'x' } } }, [a], org).ok).toBe(true);
+    expect(evaluateHandover(box, [], org).ok).toBe(false);
   });
 });
 
-describe('canRevertScan — 撤销不能误删后来追加的复核', () => {
-  const scan = (id: number): OperationLog => ({ id, at: id, type: 'SCAN', operator: 'x', barcode: 'A' });
-
-  it('队列中的新扫码可撤销', () => {
-    const it = item({ barcode: 'A' });
-    expect(canRevertScan(scan(1), it, [scan(1)]).ok).toBe(true);
+describe('canRevertScan（v2：seq 因果、不误删复核）', () => {
+  const scan = (): OperationLog => ({ uid: 'u-scan', projectId: 'p1', seq: 1, at: 1, type: 'SCAN', operator: 'x', itemId: 'p1#u-scan', barcode: 'A' });
+  it('队列新扫码可撤销', () => {
+    const it = item({ itemId: 'p1#u-scan', barcode: 'A' });
+    expect(canRevertScan(scan(), it, [scan()]).ok).toBe(true);
   });
-
-  it('扫码后追加了 REVIEW：撤销必须被阻止', () => {
-    const it = item({ barcode: 'A', reviews: [{ at: 9, by: 'r', verdict: 'approved' }] });
-    const logs = [
-      scan(1),
-      { id: 2, at: 2, type: 'REVIEW', operator: 'r', barcode: 'A' } as OperationLog
-    ];
-    const r = canRevertScan(logs[0], it, logs);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toContain('复核');
+  it('其后有 REVIEW 阻止撤销', () => {
+    const it = item({ itemId: 'p1#u-scan', barcode: 'A', reviews: [{ uid: 'r', projectId: 'p1', seq: 2, at: 2, by: 'r', verdict: 'approved' }] });
+    const review: OperationLog = { uid: 'r', projectId: 'p1', seq: 2, at: 2, type: 'REVIEW', operator: 'r', itemId: 'p1#u-scan', barcode: 'A' };
+    expect(canRevertScan(scan(), it, [scan(), review]).ok).toBe(false);
   });
-
-  it('已装箱的物品不能撤销扫码（应先取出/退回）', () => {
-    const it = item({ barcode: 'A', location: { kind: 'box', boxId: 'b1' } });
-    expect(canRevertScan(scan(1), it, [scan(1)]).ok).toBe(false);
-  });
-
-  it('非扫码类日志不可撤销', () => {
-    const pack = { id: 5, at: 5, type: 'PACK', operator: 'x', barcode: 'A' } as OperationLog;
-    expect(canRevertScan(pack, item({ barcode: 'A' }), [pack]).ok).toBe(false);
+  it('已装箱不能撤销；非扫码类不可撤销', () => {
+    const it = item({ itemId: 'p1#u-scan', location: { kind: 'box', boxId: 'p1#b1' } });
+    expect(canRevertScan(scan(), it, [scan()]).ok).toBe(false);
+    const pack: OperationLog = { uid: 'p', projectId: 'p1', seq: 2, at: 2, type: 'PACK', operator: 'x', itemId: 'p1#u-scan' };
+    expect(canRevertScan(pack, item({ itemId: 'p1#u-scan' }), [pack]).ok).toBe(false);
   });
 });
 

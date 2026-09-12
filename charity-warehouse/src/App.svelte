@@ -3,16 +3,18 @@
   import { initStore, operator, state, toast } from './lib/store';
   import QueuePage from './lib/components/QueuePage.svelte';
   import BoxesPage from './lib/components/BoxesPage.svelte';
+  import MergePage from './lib/components/MergePage.svelte';
   import ImportPage from './lib/components/ImportPage.svelte';
   import LogsPage from './lib/components/LogsPage.svelte';
   import ExportPage from './lib/components/ExportPage.svelte';
 
-  type Tab = 'scan' | 'boxes' | 'import' | 'logs' | 'export';
+  type Tab = 'scan' | 'boxes' | 'merge' | 'import' | 'logs' | 'export';
   let tab: Tab = 'scan';
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'scan', label: '扫码队列' },
     { id: 'boxes', label: '箱内明细/交接' },
+    { id: 'merge', label: '工程合并' },
     { id: 'import', label: '文件导入' },
     { id: 'logs', label: '操作日志' },
     { id: 'export', label: '清单/工程导出' }
@@ -52,6 +54,8 @@
     <QueuePage />
   {:else if tab === 'boxes'}
     <BoxesPage />
+  {:else if tab === 'merge'}
+    <MergePage />
   {:else if tab === 'import'}
     <ImportPage />
   {:else if tab === 'logs'}
